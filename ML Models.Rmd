@@ -1,0 +1,192 @@
+---
+title: "ML Models"
+author: "Iuri Guerreiro"
+date: "2025-09-04"
+output: html_document
+---
+
+```{r}
+set.seed(42)
+#install.packages("rsample")
+#install.packages("yardstick")
+#install.packages("Rtools")
+#install.packages("caret")   # if not already installed
+
+# Packages
+library(data.table)
+library(dplyr)
+library(stringr)
+library(caret)
+library(pROC)
+library(rsample)
+library(ranger)
+library(kernlab)
+library(xgboost)
+
+
+
+```
+
+
+
+#ML for Merged Dataset EEG, EDA, EYE (Features) 
+
+
+```{r}
+
+set.seed(42)
+
+
+# Load data
+
+df <- fread("data_clean/merged/merged_any_modalities.csv",
+            na.strings = c("NA", "", "null", "None")) %>% as.data.frame()
+
+
+# Map 0/1 (or strings) -> "ADHD"/"Control"
+# Set ADHD as the positive class (first level) for ROC
+
+df <- df %>%
+  mutate(
+    adhd_label = dplyr::case_when(
+      adhd_label %in% c(1, "1", "ADHD")    ~ "ADHD",
+      adhd_label %in% c(0, "0", "Control") ~ "Control",
+      TRUE ~ NA_character_
+    ),
+    adhd_label = factor(adhd_label, levels = c("ADHD","Control"))
+  ) %>%
+  filter(!is.na(adhd_label))
+
+# Metadata & features
+
+meta_cols <- c("participant_id", "eeg_session_id", "eye_session_id", "diagnosed", "adhd_label")
+target    <- "adhd_label"
+
+# Numeric feature matrix = numeric columns that are NOT metadata
+num_mask  <- sapply(df, is.numeric)
+X_numeric <- df[, num_mask & !(names(df) %in% meta_cols), drop = FALSE]
+
+
+# Impute + scale/center OUTSIDE caret (numeric only)
+
+pp <- preProcess(X_numeric, method = c("medianImpute", "center", "scale"))
+X_proc <- predict(pp, X_numeric)
+
+# Build modeling frame: keep ALL metadata + processed numeric features
+dat <- df %>%
+  dplyr::select(all_of(meta_cols)) %>%
+  bind_cols(as.data.frame(X_proc))
+
+# Define X and y for caret (exclude ALL metadata)
+X_all <- dat %>% dplyr::select(-all_of(meta_cols)) %>% as.data.frame()
+y_all <- dat[[target]]
+
+# Sanity checks
+stopifnot(is.factor(y_all))
+stopifnot(!anyNA(y_all))
+stopifnot(nrow(X_all) == length(y_all))
+
+
+# Stratified CV folds & trainControl (ROC)
+
+set.seed(42)
+folds <- createFolds(y_all, k = 5, returnTrain = TRUE)
+
+ctrl_roc <- trainControl(
+  method = "cv",
+  number = 5,
+  index  = folds,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  verboseIter = TRUE
+)
+
+
+# Random Forest (ranger)
+
+rf_grid <- expand.grid(
+  mtry = pmax(2, floor(ncol(X_all) * c(0.05, 0.15, 0.30))),
+  splitrule = "gini",
+  min.node.size = c(1, 5)
+)
+
+set.seed(42)
+rf_model <- train(
+  x = X_all, y = y_all,
+  method = "ranger",
+  trControl = ctrl_roc,
+  metric = "ROC",
+  tuneGrid = rf_grid,
+  importance = "impurity",
+  num.trees = 10000,
+  respect.unordered.factors = "order",
+  na.action = na.omit
+)
+
+print(rf_model)
+rf_best <- rf_model$results[which.max(rf_model$results$ROC),]
+cat("\nRF best (mean CV): ROC =", round(rf_best$ROC, 3),
+    "Sens =", round(rf_best$Sens, 3),
+    "Spec =", round(rf_best$Spec, 3), "\n")
+
+
+# SVM (Radial)
+
+set.seed(42)
+svm_model <- train(
+  x = X_all, y = y_all,
+  method = "svmRadial",
+  trControl = ctrl_roc,
+  metric = "ROC",
+  tuneLength = 8   # or set a manual grid for C and sigma
+)
+
+print(svm_model)
+svm_best <- svm_model$results[which.max(svm_model$results$ROC),]
+cat("\nSVM (radial) best (mean CV): ROC =", round(svm_best$ROC, 3),
+    "Sens =", round(svm_best$Sens, 3),
+    "Spec =", round(svm_best$Spec, 3), "\n")
+
+
+# XGBoost
+
+neg_count <- sum(y_all == "Control")
+pos_count <- sum(y_all == "ADHD")
+scale_pos_weight <- neg_count / pos_count
+
+xgb_grid <- expand.grid(
+  nrounds = c(200, 400),
+  max_depth = c(3, 5, 7),
+  eta = c(0.01, 0.1),
+  gamma = c(0, 1),
+  colsample_bytree = c(0.8, 1),
+  min_child_weight = c(1, 5),
+  subsample = c(0.8, 1)
+)
+
+set.seed(42)
+xgb_model <- train(
+  x = X_all, y = y_all,
+  method = "xgbTree",
+  trControl = ctrl_roc,
+  metric = "ROC",
+  tuneGrid = xgb_grid,
+  scale_pos_weight = scale_pos_weight,
+  verbose = 0
+)
+
+print(xgb_model)
+xgb_best <- xgb_model$results[which.max(xgb_model$results$ROC),]
+cat("\nXGBoost best (mean CV): ROC =", round(xgb_best$ROC, 3),
+    "Sens =", round(xgb_best$Sens, 3),
+    "Spec =", round(xgb_best$Spec, 3), "\n")
+
+
+# Feature Importance (RF)
+
+rf_imp <- varImp(rf_model, scale = TRUE)
+print(rf_imp$importance %>% arrange(desc(Overall)) %>% head(20))
+
+
+```

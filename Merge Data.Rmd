@@ -1,0 +1,240 @@
+---
+title: "Merge Features"
+author: "Iuri Guerreiro"
+date: "2025-08-31"
+output: html_document
+---
+
+```{r}
+library(data.table)  
+library(dplyr)      
+library(tidyr)        
+library(janitor)      
+library(jsonlite)     
+library(stringr)
+library(fs)
+library(tidyverse)
+```
+
+
+
+```{r}
+# Paths 
+project_root <- getwd()
+root         <- file.path(project_root, "BALLADEER")
+
+# cleaned outputs 
+path_eeg  <- file.path(project_root,"data_clean","eeg","EEG_FEATURES_MASTER.csv")
+path_eye  <- file.path(project_root, "data_clean", "eye", "features","eye_diagnostics.csv")
+path_eda  <- file.path(project_root, "data_clean", "eda","eda_features_long.csv")
+path_lab  <- file.path(project_root, "BALLADEER", "users_demographics.json")
+
+# output folder
+out_dir <- file.path(project_root, "data_clean", "merged")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# standardise participant id column to `participant_id` 
+std_id <- function(df) {
+  nm <- tolower(names(df))
+  id_idx <- which(nm %in% c("participant_id","user","username","id"))[1]
+  if (!length(id_idx)) stop("No participant id column found. Expected one of: participant_id, user, username, id.")
+  id_col <- names(df)[id_idx]
+  df %>%
+    rename(participant_id = !!id_col) %>%
+    mutate(participant_id = as.character(participant_id)) %>%
+    mutate(participant_id = str_trim(participant_id))
+}
+
+# Labels (ADHD vs Control) 
+labs_raw <- jsonlite::fromJSON(path_lab) %>% as.data.frame()
+labs     <- labs_raw %>%
+  clean_names() %>%
+  std_id() %>%
+  # keep only definitive labels
+  filter(diagnosed %in% c("yes","no")) %>%
+  mutate(
+    diagnosed = tolower(diagnosed),
+    adhd_label = ifelse(diagnosed == "yes", 1L, 0L)
+  ) %>%
+  select(participant_id, diagnosed, adhd_label)
+
+cat("Labels loaded. n =", nrow(labs), 
+    " | ADHD:", sum(labs$adhd_label==1),
+    " | Control:", sum(labs$adhd_label==0), "\n")
+
+# EEG features (already aggregated) 
+eeg_raw <- fread(path_eeg)
+eeg <- eeg_raw %>%
+  clean_names() %>%
+  std_id()
+
+# ensure one row per participant (if multiple rows, aggregate by mean)
+id_cols <- c("participant_id")
+num_cols <- setdiff(names(eeg), id_cols)
+eeg <- eeg %>%
+  group_by(participant_id) %>%
+  summarise(across(all_of(num_cols), ~ suppressWarnings(mean(as.numeric(.), na.rm = TRUE))), .groups = "drop")
+
+# prefix EEG columns
+eeg <- eeg %>%
+  rename_with(~ paste0("eeg_", .x), -participant_id)
+
+cat("EEG features loaded:", nrow(eeg), "participants,",
+    ncol(eeg)-1, "feature columns.\n")
+
+# Eye-tracking diagnostics (already summarised) 
+eye_raw <- fread(path_eye)
+eye <- eye_raw %>%
+  clean_names() %>%
+  std_id()
+
+# ensure one row per participant
+id_cols <- c("participant_id")
+num_cols <- setdiff(names(eye), id_cols)
+eye <- eye %>%
+  group_by(participant_id) %>%
+  summarise(across(all_of(num_cols), ~ suppressWarnings(mean(as.numeric(.), na.rm = TRUE))), .groups = "drop")
+
+# prefix EYE columns
+eye <- eye %>%
+  rename_with(~ paste0("eye_", .x), -participant_id)
+
+cat("Eye diagnostics loaded:", nrow(eye), "participants,",
+    ncol(eye)-1, "feature columns.\n")
+
+# EDA long → aggregate to participant-level wide 
+# Expecting columns like: username / participant_id, task, metric, value
+eda_long_raw <- fread(path_eda, showProgress = TRUE)
+eda_long <- eda_long_raw %>%
+  clean_names() %>%
+  std_id()
+
+# normalise column names for metric & value
+metric_cols <- c("metric_family")
+value_cols  <- c("feature_value")
+
+metric_col <- intersect(metric_cols, names(eda_long))[1]
+value_col  <- intersect(value_cols,  names(eda_long))[1]
+
+# coerce to numeric quietly
+eda_long[[value_col]] <- suppressWarnings(as.numeric(eda_long[[value_col]]))
+
+# aggregate across tasks -> participant x metric
+eda_part <- eda_long %>%
+  group_by(participant_id, .add = FALSE) %>%
+  group_by(participant_id, .add = TRUE) %>%  # duplicate-safe
+  # if 'task' exists, this silently ignores it during summarise across metrics
+  summarise(across(all_of(value_col), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  # but we still need metric column to pivot, so do it correctly:
+  { 
+    # If original had metric per row, summarise by participant & metric first:
+    tmp <- eda_long %>%
+      group_by(participant_id, !!sym(metric_col)) %>%
+      summarise(val = mean(!!sym(value_col), na.rm = TRUE), .groups = "drop")
+    tmp
+  } %>%
+  # wide: one row per participant; columns per EDA metric
+  pivot_wider(names_from = !!sym(metric_col), values_from = val)
+
+# prefix EDA columns
+eda_part <- eda_part %>%
+  rename_with(~ paste0("eda_", .x), -participant_id)
+
+cat("EDA features aggregated:", nrow(eda_part), "participants,",
+    ncol(eda_part)-1, "feature columns.\n")
+
+# Merge features (inner join for complete cases; left joins for relaxed set) 
+# STRICT (all modalities present):
+merged_complete <- labs %>%
+  inner_join(eeg, by = "participant_id") %>%
+  inner_join(eye, by = "participant_id") %>%
+  inner_join(eda_part, by = "participant_id")
+
+cat("Merged COMPLETE (all modalities):", nrow(merged_complete), "participants.\n")
+
+# (any modality present, still labelled):
+merged_any <- labs %>%
+  left_join(eeg,     by = "participant_id") %>%
+  left_join(eye,     by = "participant_id") %>%
+  left_join(eda_part,by = "participant_id") %>%
+  # Drop rows with no features at all (keep at least one modality)
+  filter(rowSums(!is.na(across(-c(participant_id, diagnosed, adhd_label)))) > 0)
+
+cat("Merged ANY (at least one modality):", nrow(merged_any), "participants.\n")
+
+# sanity drops (constant columns, all NA columns) 
+drop_all_na_cols <- function(df) {
+  df[, colSums(!is.na(df)) > 0, drop = FALSE]
+}
+drop_constant_cols <- function(df, except = c("participant_id","diagnosed","adhd_label")) {
+  keep <- sapply(names(df), function(nm) {
+    if (nm %in% except) return(TRUE)
+    v <- df[[nm]]
+    # only check numeric-ish
+    if (is.numeric(v)) return(length(unique(v[!is.na(v)])) > 1)
+    TRUE
+  })
+  df[, keep, drop = FALSE]
+}
+
+merged_complete <- merged_complete %>% drop_all_na_cols() %>% drop_constant_cols()
+merged_any      <- merged_any      %>% drop_all_na_cols() %>% drop_constant_cols()
+
+# Save outputs 
+fwrite(merged_complete, file.path(out_dir, "merged_all_modalities_complete.csv"))
+fwrite(merged_any,      file.path(out_dir, "merged_any_modalities.csv"))
+
+cat("Saved:\n -", file.path(out_dir, "merged_all_modalities_complete.csv"),
+    "\n -", file.path(out_dir, "merged_any_modalities.csv"), "\n")
+```
+
+```{r}
+# Adjust if your root differs
+project_root <- getwd()
+root <- file.path(project_root, "BALLADEER")
+demographics_json <- file.path(project_root,"BALLADEER", "users_demographics.json")
+eeg_manifest_csv  <- file.path(project_root,"data_clean", "eeg_sequences_csv" ,"eeg_sequences_manifest.csv")
+eye_manifest_csv  <- file.path(project_root,"data_clean", "eye_DL" ,"eye_dl_manifest.csv")
+
+# Labels from JSON 
+dem <- fromJSON(demographics_json, flatten = TRUE)
+labels <- as.data.frame(dem) %>%
+  transmute(
+    participant_id = as.character(user),
+    diagnosed = tolower(as.character(diagnosed))
+  ) %>%
+  filter(diagnosed %in% c("yes","no")) %>%
+  mutate(label = ifelse(diagnosed == "yes", 1L, 0L))
+
+# Read modality manifests
+eegm <- fread(eeg_manifest_csv) %>%
+  select(participant_id, task_context, session_id, eeg_path = path)
+
+eyem <- fread(eye_manifest_csv) %>%
+  select(participant_id, task_context, session_id, eye_path = out_path)
+
+# Single-modality labeled manifests
+dl_eeg <- eegm %>% inner_join(labels, by = "participant_id") %>%
+  relocate(participant_id, task_context, session_id, diagnosed, label, eeg_path)
+
+dl_eye <- eyem %>% inner_join(labels, by = "participant_id") %>%
+  relocate(participant_id, task_context, session_id, diagnosed, label, eye_path)
+
+fwrite(dl_eeg, "data_clean/dl_eeg_manifest.csv")
+fwrite(dl_eye, "data_clean/dl_eye_manifest.csv")
+
+# Fusion manifest: sessions that have BOTH EEG and Eye 
+fusion <- eegm %>%
+  inner_join(eyem, by = c("participant_id","task_context","session_id")) %>%
+  inner_join(labels, by = "participant_id") %>%
+  relocate(participant_id, task_context, session_id, diagnosed, label, eeg_path, eye_path)
+
+fwrite(fusion, "data_clean/dl_fusion_manifest.csv")
+
+message("Saved:")
+message(" - data_clean/dl_eeg_manifest.csv  (EEG + labels)")
+message(" - data_clean/dl_eye_manifest.csv  (Eye + labels)")
+message(" - data_clean/dl_fusion_manifest.csv (EEG+Eye + labels)")
+
+
+```

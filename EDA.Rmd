@@ -1,0 +1,1215 @@
+---
+title: "EDA BALLADEER"
+author: "Iuri Guerreiro"
+date: "2025-08-13"
+output: html_document
+---
+
+```{r}
+
+library(readr)     
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(tidyverse)
+library(janitor)
+library(data.table)
+
+
+```
+
+#1-Dataset registry
+
+```{r}
+
+#Get Data
+project_root <- getwd()
+root         <- file.path(project_root, "BALLADEER")
+stopifnot(dir.exists(root))
+
+dir.create(file.path(project_root, "data_interim"), showWarnings = FALSE)
+
+#Find EDA_files
+eda_candidates <- c(
+  file.path(project_root, "balladeer_embraceplus_data.csv"),
+  file.path(root, "balladeer_embraceplus_data.csv")
+)
+eda_path <- eda_candidates[file.exists(eda_candidates)][1]
+if (is.na(eda_path)) {
+  found <- list.files(project_root, pattern = "(?i)embraceplus|balladeer_embraceplus", recursive = TRUE, full.names = TRUE)
+  if (length(found)) eda_path <- found[1]
+}
+
+
+#Check which participants have EDA data
+eda_participants <- character(0)
+if (!is.na(eda_path)) {
+   suppressWarnings({
+   
+  })
+  
+  eda_header <- names(fread(eda_path, nrows = 0, sep = ";", showProgress =FALSE))
+  pid_col <- eda_header[grepl("(?i)username$", eda_header)]
+  pid_col <- pid_col[1]
+
+  #Read just the participant id column
+  eda_ids <- fread(eda_path, select = pid_col, sep = ";", showProgress = FALSE)
+  names(eda_ids) <- "participant_id"
+  #Normalise ID format to match your folder names (trim, as-is)
+  eda_participants <- unique(trimws(as.character(eda_ids$participant_id)))
+}
+
+#Does this participant have EDA rows?
+has_eda <- function(pid) {
+  if (length(eda_participants) == 0) return(FALSE)
+  pid %in% eda_participants
+}
+
+#Find participant folders
+participants <- list.dirs(path = root, full.names = TRUE, recursive = FALSE)
+
+#Tasks mapping 
+task_from_subfolder <- function(p) {
+  nm <- basename(p)
+  if (grepl("(?i)^slacklinelvl\\s*1$",  nm, perl = TRUE)) return("SlacklineLvl1")
+  if (grepl("(?i)^slacklinelvl\\s*6$",  nm, perl = TRUE)) return("SlacklineLvl6")
+  if (grepl("(?i)^slacklinelvl\\s*11$", nm, perl = TRUE))return("SlacklineLvl11")
+  if (grepl("(?i)^cognifit$",             nm, perl = TRUE)) return("Cognifit")
+  if (grepl("(?i)^attentionrobotsdesktop$",nm, perl = TRUE)) return("AttentionRobots")
+  return(NA_character_)
+}
+
+#Session folders are numeric 
+is_session_dir <- function(p) {
+  grepl("^[0-9]{8,}$", basename(p))
+}
+
+#Collect modality files inside a session
+collect_files_in_session <- function(session_dir) {
+  eeg_files  <- list.files(session_dir, full.names = TRUE,
+                           pattern = "(?i)(eeg|epoc|epocx|epocplus|cgx).*\\.csv$")
+  eye_files  <- list.files(session_dir, full.names = TRUE,
+                           pattern = "(?i)(eye|tracking).*\\.csv$")
+  game_files <- list.files(session_dir, full.names = TRUE,
+                           pattern = "(?i)(tag|game|event|log).*\\.csv$")
+  list(
+    eeg  = unique(eeg_files),
+    eye  = unique(eye_files),
+    game = unique(game_files)
+  )
+}
+
+#Build the registry rows
+registry_list <- lapply(participants, function(pp) {
+  task_dirs <- list.dirs(pp, full.names = TRUE, recursive = FALSE)
+  task_dirs <- Filter(function(x) !is.na(task_from_subfolder(x)), task_dirs)
+  if (!length(task_dirs)) return(NULL)
+
+  do.call(rbind, lapply(task_dirs, function(td) {
+    task <- task_from_subfolder(td)
+    session_dirs <- list.dirs(td, full.names = TRUE, recursive = FALSE)
+    session_dirs <- Filter(is_session_dir, session_dirs)
+
+    if (!length(session_dirs)) {
+      stop(sprintf("No session folder found in: %s", td))
+    }
+
+    do.call(rbind, lapply(session_dirs, function(sd) {
+      files <- collect_files_in_session(sd)
+      pid <- basename(pp)
+
+      # attach EDA file path only if participant exists in EmbracePlus file
+      eda_file_col <- if (!is.na(eda_path) && has_eda(pid)) eda_path else NA_character_
+
+      data.frame(
+        participant_id = pid,
+        task_context   = task,
+        session_id     = basename(sd),
+        folder         = sd,
+        eeg_files      = I(list(files$eeg)),
+        eye_files      = I(list(files$eye)),
+        game_files     = I(list(files$game)),
+        eda_file       = eda_file_col,        
+        stringsAsFactors = FALSE
+      )
+    }))
+  }))
+})
+
+registry <- do.call(rbind, registry_list)
+
+#Save registry 
+saveRDS(registry, file.path(project_root, "data_interim", "registry.rds"))
+
+
+```
+
+#1.1-Quick Checks
+
+```{r}
+#Quick checks
+print(as.data.frame(table(registry$task_context)))
+
+#How many tasks?
+print(colSums(data.frame(
+  eeg  = lengths(registry$eeg_files)  > 0,
+  eye  = lengths(registry$eye_files)  > 0,
+  game = lengths(registry$game_files) > 0
+)))
+
+#Total participants
+print(participants)
+  
+#How many rows have an EDA file linked?
+cat("Rows with EDA available:", sum(!is.na(registry$eda_file)), "of", nrow(registry), "\n")
+
+#Which participants are missing EDA?
+missing_eda <- setdiff(unique(registry$participant_id), eda_participants)
+if (length(missing_eda)) {
+  cat("Participants without EDA in EmbracePlus file (registry folders exist but no EDA rows found):\n")
+  print(missing_eda)
+}
+
+```
+#2-Data Cleaning
+
+#2.0-Data import
+```{r}
+
+# Load registry
+registry <- readRDS(file.path(project_root, "data_interim", "registry.rds"))
+stopifnot(is.data.frame(registry))
+
+#Create folders for clean data
+project_root <- getwd()
+dir.create(file.path(project_root, "data_clean"),    showWarnings = FALSE)
+dir.create(file.path(project_root, "data_clean/eeg"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(project_root, "data_clean/eye"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(project_root, "data_clean/eda"),showWarnings = FALSE, recursive = TRUE)
+```
+
+#EDA Cleaner
+
+```{r}
+
+# Path to EmbracePlus file (EDA Data)
+eda_path <- file.path(root, "balladeer_embraceplus_data.csv")
+
+# Load the full file (semicolon-delimited)
+eda_raw <- fread(eda_path, sep = ";", showProgress = TRUE)
+
+# Clean column names (lowercase, underscores)
+eda_clean <- eda_raw %>%
+  janitor::clean_names()
+
+
+# How many participants?
+n_participants <- n_distinct(eda_clean$username)
+cat("Unique participants in EDA file:", n_participants, "\n")
+
+# Any missing values?
+colSums(is.na(eda_clean))
+na.omit(eda_clean)
+
+# Select only modelling-useful columns 
+
+keep_patterns <- c(
+  "username",
+  "^s1_.*(mean|first_two_mean|last_two_mean|middle_mean|count|missing)$",
+  "^s6_.*(mean|first_two_mean|last_two_mean|middle_mean|count|missing)$",
+  "^s11_.*(mean|first_two_mean|last_two_mean|middle_mean|count|missing)$",
+  "^cognifit_.*(mean|count|missing)$",
+  "^robots_.*(mean|first_two_mean|last_two_mean|middle_mean|count|missing)$"
+)
+
+keep_idx <- Reduce("|", lapply(keep_patterns, function(pat) {
+  grepl(pat, names(eda_clean), ignore.case = TRUE)
+}))
+
+cols_to_keep <- names(eda_clean)[keep_idx]
+eda_keep <- eda_clean[, ..cols_to_keep]
+
+# Coerce numeric columns safely 
+numeric_candidates <- setdiff(names(eda_keep), "username")
+
+eda_keep <- eda_keep |>
+  mutate(across(all_of(numeric_candidates),
+                ~ suppressWarnings(readr::parse_number(as.character(.))),
+                .names = "{.col}"))
+
+# Missingness by column
+eda_missing_summary <- colSums(is.na(eda_keep))
+
+# Participants count
+n_participants <- dplyr::n_distinct(eda_keep$username)
+
+cat("Unique participants in EDA file:", n_participants, "\n")
+
+# Build per-task tidy table (long) 
+
+eda_long <- eda_keep |>
+  pivot_longer(
+    cols = -username,
+    names_to  = "var",
+    values_to = "value"
+  ) |>
+  mutate(
+    # task prefix: s1 / s6 / s11 / cognifit / robots
+    task_raw = str_extract(var, "^(s1|s6|s11|cognifit|robots)"),
+    task = dplyr::case_when(
+      task_raw == "s1"        ~ "SlacklineLvl1",
+      task_raw == "s6"        ~ "SlacklineLvl6",
+      task_raw == "s11"       ~ "SlacklineLvl11",
+      task_raw == "cognifit"  ~ "Cognifit",
+      task_raw == "robots"    ~ "AttentionRobots",
+      TRUE ~ "Unknown"
+    ),
+    # strip task prefix + underscore
+    tail = str_remove(var, "^(s1|s6|s11|cognifit|robots)_"),
+    # metric family (eda / prv / pulse_rate / respiratory_rate / temperature / wearing_detection)
+    metric_family = case_when(
+      str_starts(tail, "eda")                   ~ "EDA",
+      str_starts(tail, "prv")                   ~ "PRV_ms",
+      str_starts(tail, "pulse_rate")            ~ "Pulse_bpm",
+      str_starts(tail, "respiratory_rate")      ~ "Resp_brpm",
+      str_starts(tail, "temperature")           ~ "Temp_c",
+      str_starts(tail, "wearing_detection")     ~ "Wear_pct",
+      str_ends(tail, "missing")                 ~ "MissingFlag",
+      str_ends(tail, "count")                   ~ "Count",
+      TRUE                                      ~ "Other"
+    ),
+    # statistic tag
+    stat = case_when(
+      str_ends(tail, "first_two_mean") ~ "first_two_mean",
+      str_ends(tail, "last_two_mean")  ~ "last_two_mean",
+      str_ends(tail, "middle_mean")    ~ "middle_mean",
+      str_detect(tail, "_mean$") | str_detect(tail, "^.*_mean_") ~ "mean",
+      str_ends(tail, "count")      ~ "count",
+      str_ends(tail, "missing")    ~ "missing",
+      TRUE                         ~ "other"
+    )
+  ) |>
+  # keep only known metric families
+  filter(metric_family %in% c("EDA","PRV_ms","Pulse_bpm","Resp_brpm","Temp_c","Wear_pct","MissingFlag","Count"))
+
+# Light sanity bounds (only on true measurements)
+bound_metric <- function(x, m) {
+  if (m == "EDA")        x[x < 0.01 | x > 100]  <- NA_real_
+  if (m == "PRV_ms")     x[x < 10    | x > 2000] <- NA_real_
+  if (m == "Pulse_bpm")  x[x < 30    | x > 220]  <- NA_real_
+  if (m == "Resp_brpm")  x[x < 5     | x > 60]   <- NA_real_
+  if (m == "Temp_c")     x[x < 30    | x > 43]   <- NA_real_
+  if (m == "Wear_pct")   x[x < 0     | x > 100]  <- NA_real_
+  x
+}
+
+eda_long <- eda_long |>
+  group_by(metric_family) |>
+  mutate(value_bounded = bound_metric(value, unique(metric_family))) |>
+  ungroup()
+
+# Compact per-user × task features 
+# preference: mean > middle_mean > average(first_two_mean, last_two_mean)
+pick_preferred <- function(df) {
+  m   <- df$value_bounded[df$stat == "mean"]
+  mid <- df$value_bounded[df$stat == "middle_mean"]
+  ft  <- df$value_bounded[df$stat == "first_two_mean"]
+  lt  <- df$value_bounded[df$stat == "last_two_mean"]
+  if (length(m)   && any(!is.na(m)))   return(mean(m,  na.rm = TRUE))
+  if (length(mid) && any(!is.na(mid))) return(mean(mid, na.rm = TRUE))
+  if ((length(ft) + length(lt)) > 0 && any(!is.na(c(ft, lt))))
+    return(mean(c(ft, lt), na.rm = TRUE))
+  return(NA_real_)
+}
+
+eda_agg <- eda_long |>
+  filter(metric_family %in% c("EDA","PRV_ms","Pulse_bpm","Resp_brpm","Temp_c","Wear_pct")) |>
+  group_by(username, task, metric_family) |>
+  summarise(
+    feature_value = pick_preferred(cur_data()),
+    n_obs = sum(!is.na(value_bounded)),
+    .groups = "drop"
+  )
+
+# Wide format (one row per user-task)
+eda_wide <- eda_agg |>
+  select(username, task, metric_family, feature_value) |>
+  pivot_wider(names_from = metric_family, values_from = feature_value)
+
+# Save outputs
+out_dir <- file.path(project_root, "data_clean/eda")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+fwrite(eda_long, file.path(out_dir, "eda_long_basic.csv"))
+fwrite(eda_agg,  file.path(out_dir, "eda_features_long.csv"))
+fwrite(eda_wide, file.path(out_dir, "eda_features_wide.csv"))
+
+cat("Saved:\n",
+    " - data_clean/eda/eda_long_basic.csv (tidy)\n",
+    " - data_clean/eda/eda_features_long.csv (user×task×metric)\n",
+    " - data_clean/eda/eda_features_wide.csv (user×taskxwide)\n", sep = "")
+```
+
+#EEG Cleaner FEATURES for ML
+
+```{r}
+
+
+# Output folder as requested
+eeg_out_dir  <- file.path(project_root, "data_clean", "eeg")
+dir.create(eeg_out_dir, showWarnings = FALSE, recursive = TRUE)
+
+
+# Convert timestamps to seconds-from-start (works for numeric ms/s or ISO strings)
+to_seconds <- function(x) {
+  if (is.numeric(x)) {
+    # decide ms vs s using the typical delta
+    dx <- diff(x)
+    dx <- dx[is.finite(dx)]
+    if (length(dx) && median(dx, na.rm = TRUE) > 5) {
+      # large step -> likely milliseconds
+      return(as.numeric(x) / 1000)
+    } else {
+      return(as.numeric(x))
+    }
+  }
+  # character -> try POSIX; if fails, fallback numeric
+  suppressWarnings({
+    ts <- try(as.POSIXct(x, tz = "UTC"), silent = TRUE)
+  })
+  if (inherits(ts, "try-error") || all(is.na(ts))) {
+    suppressWarnings({
+      ts <- try(as.POSIXct(x, format = "%Y-%m-%dT%H:%M:%OS", tz = "UTC"), silent = TRUE)
+    })
+  }
+  if (inherits(ts, "try-error") || all(is.na(ts))) {
+    return(suppressWarnings(as.numeric(x)))
+  }
+  as.numeric(ts - min(ts, na.rm = TRUE))
+}
+
+# Hjorth parameters (activity, mobility, complexity)
+hjorth_features <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 10) {
+    return(c(activity = NA_real_, mobility = NA_real_, complexity = NA_real_))
+  }
+  dx  <- diff(x)
+  ddx <- diff(dx)
+
+  var0 <- var(x,  na.rm = TRUE)
+  var1 <- var(dx, na.rm = TRUE)
+  var2 <- var(ddx, na.rm = TRUE)
+
+  activity   <- var0
+  mobility   <- if (var0 > 0) sqrt(var1 / var0) else NA_real_
+  complexity <- if (!is.na(mobility) && var1 > 0) sqrt(var2 / var1) / mobility else NA_real_
+
+  c(activity = activity, mobility = mobility, complexity = complexity)
+}
+
+# Per-channel time-domain features (robust; no sampling rate required)
+channel_time_features <- function(v) {
+  v <- as.numeric(v)
+  v[!is.finite(v)] <- NA_real_
+
+  # Conservative EEG clamp to remove spikes (±200 µV)
+  v[v >  200] <- NA_real_
+  v[v < -200] <- NA_real_
+
+  feats <- c(
+    mean     = mean(v, na.rm = TRUE),
+    median   = median(v, na.rm = TRUE),
+    sd       = sd(v, na.rm = TRUE),
+    iqr      = IQR(v, na.rm = TRUE),
+    kurtosis = {
+      m <- mean(v, na.rm = TRUE); s <- sd(v, na.rm = TRUE)
+      if (is.finite(s) && s > 0) mean(((v - m)/s)^4, na.rm = TRUE) else NA_real_
+    },
+    skewness = {
+      m <- mean(v, na.rm = TRUE); s <- sd(v, na.rm = TRUE)
+      if (is.finite(s) && s > 0) mean(((v - m)/s)^3, na.rm = TRUE) else NA_real_
+    }
+  )
+  c(feats, hjorth_features(v))
+}
+
+# Clean & feature-extract one EEG file (first column = timestamp)
+process_one_eeg <- function(file_path, pid, task, session, out_dir) {
+  dt <- try(fread(file_path, showProgress = FALSE), silent = TRUE)
+  if (inherits(dt, "try-error")) {
+    message("Failed to read: ", file_path)
+    return(NULL)
+  }
+
+  # Clean names & drop empty columns -----------------------------------
+  setnames(dt, make_clean_names(names(dt)))
+  # remove columns that are entirely NA
+  non_empty <- names(dt)[colSums(!is.na(dt)) > 0]
+  dt <- dt[, ..non_empty]
+
+  if (ncol(dt) < 2) {
+    message("Not enough columns in: ", file_path)
+    return(NULL)
+  }
+
+  # Timestamp handling
+  time_col <- names(dt)[1]                   # you confirmed first col is timestamp
+  time_sec <- to_seconds(dt[[time_col]])
+
+  # Drop NA timestamps and order
+  keep_idx <- is.finite(time_sec)
+  dt <- dt[keep_idx]
+  time_sec <- time_sec[keep_idx]
+
+  ord <- order(time_sec)
+  dt <- dt[ord]
+  time_sec <- time_sec[ord]
+
+  # Remove duplicate timestamps (keep first)
+  if (anyDuplicated(time_sec)) {
+    keep <- !duplicated(time_sec)
+    dt <- dt[keep]
+    time_sec <- time_sec[keep]
+  }
+
+  # Identify channel columns (all numeric except timestamp) 
+  numeric_cols <- names(dt)[sapply(dt, is.numeric)]
+  channel_cols <- setdiff(numeric_cols, time_col)
+
+  # If nothing numeric besides time, try to coerce potential numeric cols
+  if (length(channel_cols) == 0) {
+    for (cc in setdiff(names(dt), time_col)) {
+      suppressWarnings({
+        xnum <- as.numeric(gsub(",", ".", dt[[cc]]))
+        if (sum(is.finite(xnum)) > 0) dt[[cc]] <- xnum
+      })
+    }
+    numeric_cols <- names(dt)[sapply(dt, is.numeric)]
+    channel_cols <- setdiff(numeric_cols, time_col)
+  }
+
+  if (length(channel_cols) == 0) {
+    message("No numeric channel columns found in: ", file_path)
+    return(NULL)
+  }
+
+  # Outlier cleaning (±200 µV) 
+  dt[, (channel_cols) := lapply(.SD, function(v) {
+    v <- as.numeric(v)
+    v[v >  200] <- NA_real_
+    v[v < -200] <- NA_real_
+    v
+  }), .SDcols = channel_cols]
+
+  # Sampling rate estimate (from timestamp deltas)
+  fs <- NA_real_
+  if (length(time_sec) > 5) {
+    dts <- diff(time_sec)
+    dts <- dts[is.finite(dts) & dts > 0]
+    if (length(dts)) fs <- 1 / median(dts)
+  }
+
+  # Per-channel features 
+  feat_list <- lapply(channel_cols, function(ch) {
+    f <- channel_time_features(dt[[ch]])
+    c(channel = ch, f)
+  })
+  feat_df <- as.data.frame(do.call(rbind, feat_list), stringsAsFactors = FALSE)
+
+  # Ensure numeric where appropriate
+  num_cols <- setdiff(names(feat_df), "channel")
+  feat_df[num_cols] <- lapply(feat_df[num_cols], function(x) as.numeric(x))
+
+  # Add identifiers & save per-file 
+  feat_df <- feat_df %>%
+    mutate(
+      participant_id = pid,
+      task_context   = task,
+      session_id     = session,
+      sampling_rate  = fs,
+      source_file    = basename(file_path)
+    ) %>%
+    relocate(participant_id, task_context, session_id, sampling_rate, source_file, channel)
+
+  out_file <- file.path(
+    eeg_out_dir,
+    paste0("EEG_FEATURES_",
+           pid, "_", task, "_", session, "_",
+           tools::file_path_sans_ext(basename(file_path)), ".csv")
+  )
+  fwrite(feat_df, out_file)
+
+  feat_df
+}
+
+#  Run over ALL EEG files in the registry 
+
+all_eeg_features <- list()
+
+for (i in seq_len(nrow(registry))) {
+  pid     <- registry$participant_id[i]
+  task    <- registry$task_context[i]
+  session <- registry$session_id[i]
+  eegs    <- registry$eeg_files[[i]]
+
+  if (length(eegs) == 0) next
+
+  message(sprintf("Processing %s | %s | %s  (#files: %d)",
+                  pid, task, session, length(eegs)))
+
+  feats_i <- lapply(eegs, function(f) {
+    process_one_eeg(f, pid, task, session, eeg_out_dir)
+  })
+
+  feats_i <- Filter(Negate(is.null), feats_i)
+  if (length(feats_i)) {
+    all_eeg_features[[length(all_eeg_features) + 1]] <- dplyr::bind_rows(feats_i)
+  }
+}
+
+# Merge all per-file features into one master CSV (for ML)
+if (length(all_eeg_features)) {
+  eeg_master <- dplyr::bind_rows(all_eeg_features)
+  fwrite(eeg_master, file.path(eeg_out_dir, "EEG_FEATURES_MASTER.csv"))
+  message("Saved master: ", file.path(eeg_out_dir, "EEG_FEATURES_MASTER.csv"))
+} else {
+  message("No EEG features were produced (check registry$eeg_files paths).")
+}
+
+```
+
+```{r}
+table(lengths(registry$eeg_files))
+
+```
+
+
+#EEG Cleaner Sequential Data for DL
+```{r}
+project_root <- getwd()
+
+SEQ_OUT_DIR   <- file.path(project_root, "data_clean", "eeg_sequences_csv")
+MANIFEST_PATH <- file.path(project_root, "data_clean", "eeg_sequences_manifest.csv")
+
+dir.create(SEQ_OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# Helpers 
+infer_headset <- function(path) {
+  nm <- basename(path)
+  if (str_detect(nm, regex("EPOC|EPOCX|EPOCPLUS", ignore_case = TRUE))) return("EPOCPLUS")
+  if (str_detect(nm, regex("CGX", ignore_case = TRUE))) return("CGX")
+  return(NA_character_)
+}
+
+save_sequence_csv <- function(dt, out_base) {
+  out <- file.path(SEQ_OUT_DIR, paste0(out_base, ".csv"))
+  data.table::fwrite(dt, out)
+  out
+}
+
+# ------------------ EPOCPLUS / EPOCX ------------------------------------ #
+# Use row 2 as header (skip=1, header=TRUE), drop explicit non-POW columns
+process_epocplus_sequence <- function(file_path, pid, task, session) {
+  dt <- tryCatch(
+    fread(file_path, skip = 1, header = TRUE, na.strings = c("", "NA"), showProgress = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(dt) || nrow(dt) < 3) {
+    message("EPOCPLUS: unreadable/short file ", basename(file_path)); return(NULL)
+  }
+
+  # Explicit non-POW list (raw names as in file)
+  non_pow_cols <- c(
+    "Timestamp","OriginalTimestamp","EEG.Counter","EEG.Interpolated",
+    "EEG.AF3","EEG.F7","EEG.F3","EEG.FC5","EEG.T7","EEG.P7","EEG.O1","EEG.O2",
+    "EEG.P8","EEG.T8","EEG.FC6","EEG.F4","EEG.F8","EEG.AF4","EEG.RawCq","EEG.Battery",
+    "EEG.BatteryPercent","MarkerIndex","MarkerType","MarkerValueInt","EEG.MarkerHardware",
+    "CQ.AF3","CQ.F7","CQ.F3","CQ.FC5","CQ.T7","CQ.P7","CQ.O1","CQ.O2","CQ.P8","CQ.T8",
+    "CQ.FC6","CQ.F4","CQ.F8","CQ.AF4","CQ.Overall","EQ.SampleRateQuality","EQ.OVERALL",
+    "EQ.AF3","EQ.F7","EQ.F3","EQ.FC5","EQ.T7","EQ.P7","EQ.O1","EQ.O2","EQ.P8","EQ.T8",
+    "EQ.FC6","EQ.F4","EQ.F8","EQ.AF4","MOT.CounterMems","MOT.InterpolatedMems","MOT.Q0",
+    "MOT.Q1","MOT.Q2","MOT.Q3","MOT.AccX","MOT.AccY","MOT.AccZ","MOT.MagX","MOT.MagY",
+    "MOT.MagZ","PM.Engagement.IsActive","PM.Engagement.Scaled","PM.Engagement.Raw",
+    "PM.Engagement.Min","PM.Engagement.Max","PM.Excitement.IsActive","PM.Excitement.Scaled",
+    "PM.Excitement.Raw","PM.Excitement.Min","PM.Excitement.Max","PM.LongTermExcitement",
+    "PM.Stress.IsActive","PM.Stress.Scaled","PM.Stress.Raw","PM.Stress.Min","PM.Stress.Max",
+    "PM.Relaxation.IsActive","PM.Relaxation.Scaled","PM.Relaxation.Raw","PM.Relaxation.Min",
+    "PM.Relaxation.Max","PM.Interest.IsActive","PM.Interest.Scaled","PM.Interest.Raw",
+    "PM.Interest.Min","PM.Interest.Max","PM.Focus.IsActive","PM.Focus.Scaled","PM.Focus.Raw",
+    "PM.Focus.Min","PM.Focus.Max","PM.Attention.IsActive","PM.Attention.Scaled","PM.Attention.Raw","PM.Attention.Min","PM.Attention.Max"
+  )
+
+  keep_cols <- setdiff(names(dt), non_pow_cols)
+  if (!length(keep_cols)) {
+    message("EPOCPLUS: after dropping non-POW, nothing left in ", basename(file_path))
+    return(NULL)
+  }
+
+  # Coerce to numeric
+  dt[, (keep_cols) := lapply(.SD, function(x) as.numeric(gsub(",", ".", x))), .SDcols = keep_cols]
+
+  # Downsample — keep only rows that have any non-NA across EEG POW columns
+  valid_idx <- which(rowSums(!is.na(dt[, ..keep_cols])) > 0)  
+  if (length(valid_idx) > 0) dt <- dt[valid_idx]              
+
+  # Remove duplicate rows across EEG columns
+  dt <- unique(dt, by = keep_cols)                            
+
+  #Outlier removal for EPOC POW.* using robust modified z-score (|mz| > 3.5)
+  
+  if (nrow(dt) > 0) {                                         
+    outlier_row <- rep(FALSE, nrow(dt))                       
+    for (c in keep_cols) {                                    
+      med <- suppressWarnings(stats::median(dt[[c]], na.rm = TRUE))     
+      madv <- suppressWarnings(stats::mad(dt[[c]], center = med, constant = 1.4826, na.rm = TRUE))  
+      if (is.finite(madv) && madv > 0) {                      
+        mz <- abs(dt[[c]] - med) / (madv + 1e-8)              
+        outlier_row <- outlier_row | (mz > 3.5)               
+      }
+    }
+    if (any(outlier_row)) dt <- dt[!outlier_row]              
+  }
+
+  out_base <- paste0("EEGSEQ_", pid, "_", task, "_", session)
+  out_path <- save_sequence_csv(dt[, ..keep_cols], out_base)
+
+  list(
+    path = out_path,
+    T = nrow(dt),
+    F = length(keep_cols),
+    headset = "EPOCPLUS"
+  )
+}
+
+# ------------------ CGX -------------------------------------------------- #
+# Drop timestamps + last 4 non-EEG cols, keep everything else (raw names)
+process_cgx_sequence <- function(file_path, pid, task, session) {
+  bname <- basename(file_path)
+  if (str_detect(bname, regex("_TAGS_CGX_", ignore_case = TRUE))) {
+    message("CGX: skipping TAGS file ", bname); return(NULL)
+  }
+
+  dt <- tryCatch(
+    fread(file_path, showProgress = FALSE, na.strings = c("", "NA")),
+    error = function(e) NULL
+  )
+  if (is.null(dt) || ncol(dt) < 3) {
+    message("CGX: unreadable or trivial file ", bname); return(NULL)
+  }
+
+  # Drop by exact raw names
+  drop_cols <- c("timestamps","ACC32(mg)","ACC33(mg)","ACC34(mg)","Packet Counter","TRIGGER","ExG 1(uV)","ExG 2(uV)")
+  keep_cols <- setdiff(names(dt), drop_cols)
+
+  if (!length(keep_cols)) {
+    message("CGX: after dropping, nothing left in ", bname); return(NULL)
+  }
+
+  # Convert to numeric
+  dt[, (keep_cols) := lapply(.SD, function(x) as.numeric(gsub(",", ".", x))), .SDcols = keep_cols]
+
+  #Downsample — keep only rows that have any non-NA across EEG µV channels
+  valid_idx <- which(rowSums(!is.na(dt[, ..keep_cols])) > 0)  
+  if (length(valid_idx) > 0) dt <- dt[valid_idx]              
+
+  #Remove duplicate rows across EEG columns
+  dt <- unique(dt, by = keep_cols)                            
+
+   #Outlier removal for CGX (µV) using robust modified z-score on centered signals
+  if (nrow(dt) > 0) {                                                                 
+    # Center each channel by its median to remove DC offset                                          
+    med_vec <- dt[, lapply(.SD, function(x) suppressWarnings(stats::median(x, na.rm = TRUE))), .SDcols = keep_cols]  
+    # subtract median per column                                                                      
+    centered <- dt[, Map(function(x, m) x - m, .SD, med_vec), .SDcols = keep_cols]                   
+
+    # Compute channel-wise MAD (with 1.4826 consistency factor)                                       
+    mad_vec <- centered[, lapply(.SD, function(x) suppressWarnings(stats::mad(x, constant = 1.4826, na.rm = TRUE))), .SDcols = keep_cols]  
+
+    # Build a logical vector of outlier rows: any channel’s |modified z| > thresh                     
+    mz_thresh <- 5.0                                                                                  
+    # avoid divide-by-zero: replace zero/NA MAD with a large value so it won’t falsely trigger        
+    mad_safe <- lapply(mad_vec, function(v) { v[is.na(v) | v <= 1e-12] <- 1e9; v })                   
+    # compute per-channel |modified z| = |centered| / MAD                                              
+    mz_dt <- as.data.table(Map(function(x, m) abs(x) / m, centered, mad_safe))                        
+
+    bad <- mz_dt[, apply(.SD, 1, function(r) any(is.finite(r) & (r > mz_thresh))), .SDcols = keep_cols]  
+    if (any(bad)) dt <- dt[!bad]                                                                       
+  }
+
+  out_base <- paste0("EEGSEQ_", pid, "_", task, "_", session)
+  out_path <- save_sequence_csv(dt[, ..keep_cols], out_base)
+
+  list(
+    path = out_path,
+    T = nrow(dt),
+    F = length(keep_cols),
+    headset = "CGX"
+  )
+}
+
+# ---------------- Dispatcher ---------------- #
+process_one_eeg_sequence <- function(file_path, pid, task, session) {
+  headset <- infer_headset(file_path)
+  res <- if (identical(headset, "EPOCPLUS")) {
+    process_epocplus_sequence(file_path, pid, task, session)
+  } else if (identical(headset, "CGX")) {
+    process_cgx_sequence(file_path, pid, task, session)
+  } else {
+    message("Unknown headset for file: ", basename(file_path))
+    NULL
+  }
+  res
+}
+
+# ---------------- Run over registry ---------------- #
+if (exists("registry") && is.data.frame(registry) &&
+    all(c("participant_id","task_context","session_id","eeg_files") %in% names(registry))) {
+
+  manifest_rows <- list()
+
+  for (i in seq_len(nrow(registry))) {
+    pid     <- registry$participant_id[i]
+    task    <- registry$task_context[i]
+    session <- registry$session_id[i]
+    eegs    <- registry$eeg_files[[i]]
+    if (length(eegs) == 0) next
+
+    for (f in eegs) {
+      res <- tryCatch(process_one_eeg_sequence(f, pid, task, session),
+                      error = function(e) { message(e$message); NULL })
+      if (!is.null(res)) {
+        manifest_rows[[length(manifest_rows) + 1]] <- data.frame(
+          participant_id = pid,
+          task_context   = task,
+          session_id     = session,
+          headset        = res$headset,
+          path           = res$path,
+          T              = res$T,
+          F              = res$F,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+
+  if (length(manifest_rows)) {
+    manifest <- dplyr::bind_rows(manifest_rows) %>%
+      arrange(participant_id, task_context, session_id, headset)
+    data.table::fwrite(manifest, MANIFEST_PATH)
+    message("EEG sequences saved in: ", SEQ_OUT_DIR)
+    message("Manifest: ", MANIFEST_PATH)
+  } else {
+    message("No EEG sequences were produced (check file formats/paths).")
+  }
+
+} else {
+  message("Note: 'registry' not found with expected columns. Define it and re-run this chunk.")
+}
+
+```
+
+```{r}
+# how many rows have ≥1 EEG?
+sum(lengths(registry$eeg_files) > 0)
+
+# peek at first few non-empty EEG paths
+idx_nonempty <- which(lengths(registry$eeg_files) > 0)[1:5]
+registry[idx_nonempty, c("participant_id","task_context","session_id")]
+
+# print the actual file paths
+registry$eeg_files[idx_nonempty]
+
+# confirm existence for one row (e.g., first non-empty)
+all(file.exists(registry$eeg_files[[ idx_nonempty[1] ]]))
+```
+
+#EYE-TRACKING Cleaner for ML
+
+```{r}
+
+dir.create(file.path(project_root, "data_clean", "eye", "features"), recursive = TRUE, showWarnings = FALSE)
+
+# Load registry 
+registry <- readRDS(file.path(project_root, "data_interim", "registry.rds"))
+
+# Rows that have eye files
+eye_rows <- which(lengths(registry$eye_files) > 0)
+if (!length(eye_rows)) stop("No eye files found in registry$eye_files.")
+
+
+# Helpers
+
+
+# Robust read for one eye CSV
+read_eye_csv <- function(path) {
+  dt <- tryCatch(
+    fread(path, na.strings = c("", "NA", "NaN", "null")),
+    error = function(e) {
+      message("Failed to read eye file: ", path, " | ", e$message)
+      return(NULL)
+    }
+  )
+  if (is.null(dt) || nrow(dt) == 0) return(NULL)
+  df <- as_tibble(dt) %>% clean_names()
+
+  # Expect these columns after clean_names()
+  needed <- c("time_checked", "weight", "looked_col", "looked_row")
+  missing <- setdiff(needed, names(df))
+  if (length(missing)) {
+    message("Skipping (missing columns): ", paste(missing, collapse = ", "), " in ", basename(path))
+    return(NULL)
+  }
+
+  # Coerce types
+  df <- df %>%
+    mutate(
+      time_checked = suppressWarnings(as.numeric(time_checked)),
+      time_checked = ifelse(
+        is.na(time_checked),
+        suppressWarnings(as.numeric(as.POSIXct(time_checked, tz = "UTC"))),
+        time_checked
+      ),
+      weight     = suppressWarnings(as.numeric(weight)),
+      looked_col = suppressWarnings(as.integer(looked_col)),
+      looked_row = suppressWarnings(as.integer(looked_row))
+    ) %>%
+    filter(!is.na(time_checked)) %>%
+    arrange(time_checked, looked_col, looked_row, weight) %>%
+    distinct(time_checked, looked_col, looked_row, weight, .keep_all = TRUE)
+
+  if (nrow(df) == 0) return(NULL)
+  df
+}
+
+# Augment with session-relative time, velocity, etc.
+augment_eye_samples <- function(df,
+                                min_weight = 0,
+                                cap_outliers = TRUE,
+                                grid_clip = TRUE) {
+  t0 <- min(df$time_checked, na.rm = TRUE)
+  df <- df %>%
+    mutate(
+      t_rel_ms = as.numeric((time_checked - t0)) * ifelse(max(time_checked) > 1e6, 1000, 1)
+    )
+
+  df <- df %>%
+    mutate(valid_weight = ifelse(is.na(weight), 0L, ifelse(weight > min_weight, 1L, 0L)))
+
+  qx <- quantile(df$looked_col, probs = c(0.01, 0.99), na.rm = TRUE)
+  qy <- quantile(df$looked_row, probs = c(0.01, 0.99), na.rm = TRUE)
+
+  if (grid_clip) {
+    df <- df %>%
+      mutate(
+        looked_col_clipped = pmin(pmax(looked_col, qx[1]), qx[2]),
+        looked_row_clipped = pmin(pmax(looked_row, qy[1]), qy[2])
+      )
+  } else {
+    df <- df %>%
+      mutate(
+        looked_col_clipped = looked_col,
+        looked_row_clipped = looked_row
+      )
+  }
+
+  df <- df %>%
+    arrange(t_rel_ms) %>%
+    mutate(
+      d_col = looked_col_clipped - dplyr::lag(looked_col_clipped),
+      d_row = looked_row_clipped - dplyr::lag(looked_row_clipped),
+      dt_ms = t_rel_ms - dplyr::lag(t_rel_ms),
+      vel_grid_per_s = ifelse(!is.na(dt_ms) & dt_ms > 0,
+                              sqrt((d_col^2 + d_row^2)) / (dt_ms / 1000),
+                              NA_real_)
+    )
+
+  v_med <- suppressWarnings(median(df$vel_grid_per_s, na.rm = TRUE))
+  v_iqr <- suppressWarnings(IQR(df$vel_grid_per_s, na.rm = TRUE))
+  v_thr <- v_med + 3 * v_iqr
+  if (!is.finite(v_thr) || is.na(v_thr)) {
+    v_thr <- suppressWarnings(quantile(df$vel_grid_per_s, 0.95, na.rm = TRUE))
+  }
+
+  df <- df %>%
+    mutate(
+      is_saccade  = ifelse(!is.na(vel_grid_per_s) & vel_grid_per_s > v_thr, 1L, 0L),
+      is_fixation = ifelse(!is.na(vel_grid_per_s) & vel_grid_per_s <= v_thr, 1L, 0L),
+      on_screen   = ifelse(!is.na(looked_col_clipped) & !is.na(looked_row_clipped), 1L, 0L),
+      valid       = ifelse(valid_weight == 1L & on_screen == 1L, 1L, 0L)
+    )
+
+  if (cap_outliers) {
+    max_reasonable <- suppressWarnings(quantile(df$vel_grid_per_s, 0.999, na.rm = TRUE))
+    df <- df %>%
+      mutate(vel_grid_per_s = ifelse(vel_grid_per_s > max_reasonable, NA_real_, vel_grid_per_s))
+  }
+
+  df
+}
+
+# Resample to uniform grid (50 Hz)
+resample_eye <- function(df, target_hz = 50, gap_limit_ms = 200) {
+  step_ms <- round(1000 / target_hz)
+  t_grid  <- seq(from = min(df$t_rel_ms, na.rm = TRUE),
+                 to   = max(df$t_rel_ms, na.rm = TRUE),
+                 by   = step_ms)
+
+  df <- df %>% arrange(t_rel_ms)
+  idx <- findInterval(t_grid, df$t_rel_ms)
+
+  valid_idx <- idx > 0
+  res <- tibble(t_rel_ms = t_grid)
+
+  prev_time <- ifelse(valid_idx, df$t_rel_ms[idx], NA_real_)
+  gap_ms    <- abs(t_grid - prev_time)
+  within_gap <- ifelse(valid_idx & !is.na(gap_ms) & gap_ms <= gap_limit_ms, TRUE, FALSE)
+
+  carry <- function(x) {
+    out <- rep(NA, length(t_grid))
+    out[within_gap] <- df[[x]][idx[within_gap]]
+    out
+  }
+
+  res <- res %>%
+    mutate(
+      looked_col_clipped = carry("looked_col_clipped"),
+      looked_row_clipped = carry("looked_row_clipped"),
+      weight             = carry("weight"),
+      valid              = carry("valid")
+    ) %>%
+    mutate(
+      d_col = looked_col_clipped - lag(looked_col_clipped),
+      d_row = looked_row_clipped - lag(looked_row_clipped),
+      vel_grid_per_s = ifelse(!is.na(d_col) & !is.na(d_row),
+                              sqrt(d_col^2 + d_row^2) / (step_ms / 1000),
+                              NA_real_)
+    )
+
+  res
+}
+
+# compute features 
+compute_eye_window_features <- function(df, window_secs = 5, overlap = 0.5) {
+  needed <- c("t_rel_ms","looked_col_clipped","looked_row_clipped","vel_grid_per_s","valid","weight")
+  if (!all(needed %in% names(df))) return(tibble())
+
+  dt_est <- median(diff(df$t_rel_ms), na.rm = TRUE)
+  if (!is.finite(dt_est) || is.na(dt_est)) dt_est <- 20
+
+  win_len <- round((window_secs * 1000) / dt_est)
+  hop     <- max(1L, round(win_len * (1 - overlap)))
+
+  # if not enough rows, return empty
+  if (nrow(df) < win_len) return(tibble())
+
+  starts <- seq(1, nrow(df) - win_len + 1, by = hop)
+  ends   <- starts + win_len - 1
+
+  purrr::pmap_dfr(list(starts, ends), function(s, e) {
+    seg <- df[s:e, ]
+    n <- nrow(seg); if (n == 0) return(NULL)
+
+    prop_valid  <- mean(seg$valid == 1, na.rm = TRUE)
+    mean_weight <- mean(seg$weight, na.rm = TRUE)
+    longest_gap <- {
+      r <- rle(ifelse(is.na(seg$valid) | seg$valid == 0, 1L, 0L))
+      if (!length(r$lengths)) 0 else max(r$lengths[r$values == 1], na.rm = TRUE) * dt_est
+    }
+
+    sd_col <- sd(seg$looked_col_clipped, na.rm = TRUE)
+    sd_row <- sd(seg$looked_row_clipped, na.rm = TRUE)
+
+    v_med  <- median(seg$vel_grid_per_s, na.rm = TRUE)
+    v_mad  <- mad(seg$vel_grid_per_s, na.rm = TRUE)
+    v_mean <- mean(seg$vel_grid_per_s, na.rm = TRUE)
+
+    thr <- {
+      iqr <- IQR(seg$vel_grid_per_s, na.rm = TRUE); med <- median(seg$vel_grid_per_s, na.rm = TRUE)
+      if (!is.finite(iqr) || is.na(iqr)) quantile(seg$vel_grid_per_s, 0.95, na.rm = TRUE) else med + 3*iqr
+    }
+    is_sacc <- ifelse(seg$vel_grid_per_s > thr, 1L, 0L)
+    is_fix  <- ifelse(!is.na(seg$vel_grid_per_s) & seg$vel_grid_per_s <= thr, 1L, 0L)
+
+    tibble(
+      window_start_ms = df$t_rel_ms[s],
+      window_end_ms   = df$t_rel_ms[e],
+      n_samples       = n,
+      prop_valid      = prop_valid,
+      mean_weight     = mean_weight,
+      longest_gap_ms  = longest_gap,
+      sd_col          = sd_col,
+      sd_row          = sd_row,
+      vel_median      = v_med,
+      vel_mad         = v_mad,
+      vel_mean        = v_mean,
+      sacc_count      = sum(is_sacc, na.rm = TRUE),
+      fix_prop        = mean(is_fix == 1, na.rm = TRUE)
+    )
+  })
+}
+
+
+# Main loop
+
+eye_feature_rows <- list()
+diag_rows        <- list()
+
+for (r in eye_rows) {
+  pid  <- registry$participant_id[r]
+  task <- registry$task_context[r]
+  sid  <- registry$session_id[r]
+
+  paths <- registry$eye_files[[r]]
+  for (p in paths) {
+    if (!file.exists(p)) {
+      message("Missing eye file: ", p)
+      next
+    }
+
+    df <- read_eye_csv(p)
+    if (is.null(df) || nrow(df) == 0) {
+      message("Empty/invalid eye file: ", p)
+      next
+    }
+
+    df <- augment_eye_samples(df)
+    df_res <- resample_eye(df, target_hz = 50, gap_limit_ms = 200)
+
+    out_name <- sprintf("%s_%s_%s_eye_clean.csv", pid, task, sid)
+    fwrite(
+      cbind(
+        participant_id = pid,
+        task_context   = task,
+        session_id     = sid,
+        df_res
+      ),
+      file = file.path(project_root, "data_clean", "eye", out_name)
+    )
+
+    feat <- compute_eye_window_features(df_res, window_secs = 5, overlap = 0.5)
+    if (nrow(feat)) {
+      feat <- feat %>%
+        mutate(
+          participant_id = pid,
+          task_context   = task,
+          session_id     = sid
+        ) %>%
+        relocate(participant_id, task_context, session_id, window_start_ms, window_end_ms)
+      eye_feature_rows[[length(eye_feature_rows) + 1]] <- feat
+    }
+
+    diag <- tibble(
+      participant_id = pid,
+      task_context   = task,
+      session_id     = sid,
+      n_rows_raw     = nrow(df),
+      n_rows_resamp  = nrow(df_res),
+      pct_valid      = round(100 * mean(df_res$valid == 1, na.rm = TRUE), 1),
+      median_vel     = median(df_res$vel_grid_per_s, na.rm = TRUE)
+    )
+    diag_rows[[length(diag_rows) + 1]] <- diag
+  }
+}
+
+eye_features_all <- if (length(eye_feature_rows)) bind_rows(eye_feature_rows) else tibble()
+eye_diag_all     <- if (length(diag_rows))        bind_rows(diag_rows)        else tibble()
+
+if (nrow(eye_features_all)) {
+  write.csv(eye_features_all,
+            file.path(project_root, "data_clean", "eye", "features", "eye_windows.csv"),
+            row.names = FALSE)
+}
+write.csv(eye_diag_all,
+          file.path(project_root, "data_clean", "eye", "features", "eye_diagnostics.csv"),
+          row.names = FALSE)
+
+cat("Eye cleaning complete.\n")
+
+```
+
+#EYE Cleaner for DL
+
+```{r}
+#  EYE DL SEQUENCE EXPORT (no transformations)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringr)
+  library(dplyr)
+})
+
+# Paths 
+EYE_DL_DIR      <- file.path(project_root, "data_clean", "eye_DL")
+EYE_DL_MANIFEST <- file.path(EYE_DL_DIR, "eye_dl_manifest.csv")
+dir.create(EYE_DL_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Small helper 
+.normalize_eye_paths <- function(x) {
+  if (is.list(x))  return(unlist(x, use.names = FALSE))
+  if (is.character(x)) return(x[!is.na(x) & nzchar(x)])
+  character(0)
+}
+
+# Core: copy/standardize eye CSVs without altering columns 
+save_eye_dl_csv <- function(in_path, pid, task, session) {
+  dt <- fread(in_path, showProgress = FALSE, na.strings = c("", "NA"))
+  if (nrow(dt) == 0) {
+    message("EYE_DL: empty -> ", in_path)
+    return(NULL)
+  }
+
+  safe_task <- gsub("[^A-Za-z0-9_-]+", "", task)
+  out_base  <- sprintf("EYEDL_%s_%s_%s", pid, safe_task, session)
+  out_path  <- file.path(EYE_DL_DIR, paste0(out_base, ".csv"))
+
+  fwrite(dt, out_path)
+
+  list(path = out_path, rows = nrow(dt), cols = ncol(dt))
+}
+
+# Run over registry
+manifest_rows <- list()
+
+for (i in seq_len(nrow(registry))) {
+  pid     <- registry$participant_id[i]
+  task    <- registry$task_context[i]
+  session <- registry$session_id[i]
+
+  paths_i <- if ("eye_files" %in% names(registry)) {
+    .normalize_eye_paths(registry$eye_files[[i]])
+  } else {
+    .normalize_eye_paths(registry$eye_file[i])
+  }
+
+  idx <- 0L
+  for (p in paths_i) {
+    idx <- idx + 1L
+    sess_out <- if (length(paths_i) > 1) paste0(session, "_f", idx) else session
+    res <- save_eye_dl_csv(p, pid, task, sess_out)
+    if (!is.null(res)) {
+      manifest_rows[[length(manifest_rows) + 1L]] <- data.frame(
+        participant_id = pid,
+        task_context   = task,
+        session_id     = sess_out,
+        source_path    = p,
+        out_path       = res$path,
+        n_rows         = res$rows,
+        n_cols         = res$cols,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+
+manifest <- dplyr::bind_rows(manifest_rows) %>%
+  arrange(participant_id, task_context, session_id)
+fwrite(manifest, EYE_DL_MANIFEST)
+
+message("EYE DL CSVs saved to: ", EYE_DL_DIR)
+message("Manifest: ", EYE_DL_MANIFEST)
+# END EYE DL SEQUENCE EXPORT 
+```
